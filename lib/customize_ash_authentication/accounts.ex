@@ -5,5 +5,6 @@ defmodule CustomizeAshAuthentication.Accounts do
   resources do
     resource CustomizeAshAuthentication.Accounts.Token
     resource CustomizeAshAuthentication.Accounts.User
+    resource CustomizeAshAuthentication.Accounts.Profile
   end
 end

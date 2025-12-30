@@ -104,6 +104,10 @@ defmodule CustomizeAshAuthentication.Accounts.User do
     end
   end
 
+  relationships do
+    has_one :profile, CustomizeAshAuthentication.Accounts.Profile
+  end
+
   identities do
     identity :unique_email, [:email]
   end
