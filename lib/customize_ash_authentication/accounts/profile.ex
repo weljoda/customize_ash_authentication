@@ -13,6 +13,40 @@ defmodule CustomizeAshAuthentication.Accounts.Profile do
     end
   end
 
+  actions do
+    defaults [:read]
+
+    create :create_on_registration do
+      primary? true
+      upsert? true
+      accept [:first_name, :last_name]
+    end
+
+    update :update do
+      primary? true
+      require_atomic? false
+      accept [:first_name, :last_name]
+    end
+  end
+
+  validations do
+    validate string_length(:first_name, min: 2),
+      message: "Please enter a first name",
+      on: [:create, :update]
+
+    validate present(:first_name),
+      message: "Please enter a first name",
+      on: [:create, :update]
+
+    validate string_length(:last_name, min: 2),
+      message: "Please enter a last name",
+      on: [:create, :update]
+
+    validate present(:last_name),
+      message: "Please enter a last name",
+      on: [:create, :update]
+  end
+
   attributes do
     uuid_primary_key :id
     attribute :first_name, :string

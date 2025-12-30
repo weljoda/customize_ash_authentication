@@ -65,9 +65,16 @@ defmodule CustomizeAshAuthentication.Accounts.User do
         allow_nil? true
       end
 
+      argument :profile, :map
+
       upsert? true
       upsert_identity :unique_email
       upsert_fields [:email]
+
+      change manage_relationship(:profile,
+               on_no_match: :create,
+               on_match: :update
+             )
 
       # Uses the information from the token to create or sign in the user
       change AshAuthentication.Strategy.MagicLink.SignInChange

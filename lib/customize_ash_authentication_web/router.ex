@@ -71,13 +71,15 @@ defmodule CustomizeAshAuthenticationWeb.Router do
       ]
 
     # Remove this if you do not use the magic link strategy.
-    magic_sign_in_route(CustomizeAshAuthentication.Accounts.User, :magic_link,
-      auth_routes_prefix: "/auth",
-      overrides: [
-        CustomizeAshAuthenticationWeb.AuthOverrides,
-        Elixir.AshAuthentication.Phoenix.Overrides.DaisyUI
-      ]
-    )
+    # magic_sign_in_route(CustomizeAshAuthentication.Accounts.User, :magic_link,
+    #   auth_routes_prefix: "/auth",
+    #   overrides: [
+    #     CustomizeAshAuthenticationWeb.AuthOverrides,
+    #     Elixir.AshAuthentication.Phoenix.Overrides.DaisyUI
+    #   ]
+    # )
+
+    live "/magic_link/:token", MagicSignIn, :show
   end
 
   # Other scopes may use custom stacks.
