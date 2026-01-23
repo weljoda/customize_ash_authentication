@@ -42,7 +42,6 @@ defmodule CustomizeAshAuthenticationWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
-    auth_routes AuthController, CustomizeAshAuthentication.Accounts.User, path: "/auth"
     sign_out_route AuthController
 
     # Remove these if you'd like to use your own authentication views
@@ -80,6 +79,27 @@ defmodule CustomizeAshAuthenticationWeb.Router do
     # )
 
     live "/magic_link/:token", MagicSignIn, :show
+  end
+
+  scope "/", CustomizeAshAuthenticationWeb do
+    pipe_through [:browser, :put_ash_request_context_metadata]
+
+    auth_routes AuthController, CustomizeAshAuthentication.Accounts.User, path: "/auth"
+  end
+
+  defp put_ash_request_context_metadata(conn, _opts) do
+    ip =
+      conn.remote_ip
+      |> :inet.ntoa()
+      |> to_string()
+      |> AshAuthentication.AddOn.AuditLog.IpPrivacy.apply_privacy(:truncate, %{})
+
+    user_agent =
+      conn
+      |> Plug.Conn.get_req_header("user-agent")
+      |> List.first()
+
+    Ash.PlugHelpers.set_context(conn, %{shared: %{client_ip: ip, user_agent: user_agent}})
   end
 
   # Other scopes may use custom stacks.
