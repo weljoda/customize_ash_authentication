@@ -51,7 +51,7 @@ config :spark,
 config :customize_ash_authentication,
   ecto_repos: [CustomizeAshAuthentication.Repo],
   generators: [timestamp_type: :utc_datetime],
-  ash_domains: [CustomizeAshAuthentication.Accounts],
+  ash_domains: [CustomizeAshAuthentication.Legal, CustomizeAshAuthentication.Accounts],
   ash_authentication: [return_error_on_invalid_magic_link_token?: true]
 
 # Configures the endpoint
