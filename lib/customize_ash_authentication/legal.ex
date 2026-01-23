@@ -4,5 +4,6 @@ defmodule CustomizeAshAuthentication.Legal do
 
   resources do
     resource CustomizeAshAuthentication.Legal.DocumentVersion
+    resource CustomizeAshAuthentication.Legal.UserAcknowledgement
   end
 end
