@@ -79,6 +79,8 @@ defmodule CustomizeAshAuthenticationWeb.Router do
     # )
 
     live "/magic_link/:token", MagicSignIn, :show
+
+    get "/documents/:type", DocumentController, :show
   end
 
   scope "/", CustomizeAshAuthenticationWeb do
