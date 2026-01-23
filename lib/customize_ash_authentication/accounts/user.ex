@@ -113,6 +113,17 @@ defmodule CustomizeAshAuthentication.Accounts.User do
 
   relationships do
     has_one :profile, CustomizeAshAuthentication.Accounts.Profile
+
+    has_many :acknowledgements, CustomizeAshAuthentication.Legal.UserAcknowledgement
+
+    many_to_many :document_version_acknowledgements,
+                 CustomizeAshAuthentication.Legal.DocumentVersion do
+      join_relationship :acknowledgements
+    end
+  end
+
+  aggregates do
+    list :acknowledged_document_version_ids, :document_version_acknowledgements, :id
   end
 
   identities do
