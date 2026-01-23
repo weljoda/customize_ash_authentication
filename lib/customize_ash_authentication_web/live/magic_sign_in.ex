@@ -50,28 +50,54 @@ defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
          %{
            assigns: %{
              token: token,
+             acknowledged_document_version_ids: acknowledged_document_version_ids,
              profile: profile
            }
          } = socket
        ) do
+    document_versions =
+      CustomizeAshAuthentication.Legal.list_latest_document_versions!()
+      |> Enum.filter(fn document_version ->
+        document_version.id not in acknowledged_document_version_ids
+      end)
+
+    acknowledgements =
+      document_versions
+      |> Enum.map(fn document_version ->
+        %{
+          accepted: false,
+          document_version_id: document_version.id
+        }
+      end)
+
     form =
       AshPhoenix.Form.for_create(
         User,
         :sign_in_with_magic_link,
-        params: %{profile: profile, token: token},
+        params: %{
+          profile: profile,
+          acknowledgements: acknowledgements,
+          token: token
+        },
         as: "user",
-        load: [:profile],
+        load: [:profile, :acknowledgements],
         forms: [
           profile: [
             type: :single,
             resource: Profile,
             create_action: :create_on_registration
+          ],
+          acknowledgements: [
+            type: :list,
+            resource: CustomizeAshAuthentication.Legal.UserAcknowledgement,
+            create_action: :create
           ]
         ]
       )
 
     socket
     |> assign(:form, to_form(form))
+    |> assign(:document_versions, document_versions)
   end
 
   defp assign_email(%{assigns: %{token: token}} = socket) do
@@ -92,6 +118,7 @@ defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
   defp assign_user_assigns(%{assigns: %{email: email}} = socket) do
     case Accounts.get_user_by_email!(email,
            load: [
+             :acknowledged_document_version_ids,
              profile: [:first_name, :last_name, :full_name]
            ],
            not_found_error?: false,
@@ -100,12 +127,14 @@ defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
       nil ->
         socket
         |> assign(:profile, %{})
+        |> assign(:acknowledged_document_version_ids, [])
         |> assign(:action_label, label(true))
         |> assign(:name, nil)
 
       user ->
         socket
         |> assign(:profile, profile_to_map(user.profile))
+        |> assign(:acknowledged_document_version_ids, user.acknowledged_document_version_ids)
         |> assign(:action_label, label(false))
         |> assign(:name, if(user.profile, do: user.profile.full_name, else: nil))
     end
@@ -123,6 +152,15 @@ defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
     do: assign(socket, :page_title, label(true))
 
   defp label(is_registration), do: if(is_registration, do: "Register", else: "Login")
+
+  defp acknowledgement_label(%{effective_from: effective_from, type: type}),
+    do: """
+    I accept the
+    <a href=#{~p"/documents/#{type}"} class="underline" target="_blank">
+    #{type |> Atom.to_string() |> CustomizeAshAuthenticationWeb.DocumentController.type_to_title()}.
+    </a>
+    Effective since: #{effective_from |> DateTime.to_date() |> Date.to_string()}
+    """
 
   @impl true
   def render(assigns) do
@@ -166,6 +204,21 @@ defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
                   />
                 </.inputs_for>
               <% end %>
+
+              <.inputs_for :let={acknowledgement} field={@form[:acknowledgements]}>
+                <input
+                  type="hidden"
+                  name={acknowledgement[:document_version_id].name}
+                  value={acknowledgement[:document_version_id].value}
+                />
+                <.input
+                  field={acknowledgement[:accepted]}
+                  type="checkbox"
+                  label={
+                    @document_versions |> Enum.at(acknowledgement.index) |> acknowledgement_label()
+                  }
+                />
+              </.inputs_for>
 
               <button
                 class="btn btn-primary btn-block mt-4 mb-4"

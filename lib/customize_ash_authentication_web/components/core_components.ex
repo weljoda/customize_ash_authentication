@@ -197,7 +197,8 @@ defmodule CustomizeAshAuthenticationWeb.CoreComponents do
             checked={@checked}
             class={@class || "checkbox checkbox-sm"}
             {@rest}
-          />{@label}
+          />
+          {Phoenix.HTML.raw(@label)}
         </span>
       </label>
       <.error :for={msg <- @errors}>{msg}</.error>
