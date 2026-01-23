@@ -14,6 +14,28 @@ defmodule CustomizeAshAuthentication.Legal.UserAcknowledgement do
     end
   end
 
+  actions do
+    defaults [:read]
+
+    create :create do
+      primary? true
+      accept [:document_version_id]
+
+      argument :accepted, :boolean do
+        allow_nil? false
+      end
+
+      change before_action(fn %{context: context} = changeset, _context ->
+               changeset
+               |> Ash.Changeset.force_change_attribute(:ip, context[:client_ip])
+               |> Ash.Changeset.force_change_attribute(:user_agent, context[:user_agent])
+             end)
+
+      validate argument_equals(:accepted, true),
+        message: "An acknowledgment is required"
+    end
+  end
+
   attributes do
     uuid_primary_key :id
 
