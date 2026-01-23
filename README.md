@@ -1,373 +1,544 @@
-# Ash Authentication - Customize Magic Link (Part 1)
+# Ash Authentication - Customize Magic Link (Part 2)
 
-This example project demonstrates how to customize Ash Authentication by adding a user profile and enforcing its creation during registration. In Part 2, we will expand this to request user acknowledgement for privacy policies or general terms and conditions (GDPR).
+In [Part 1](https://coding-individuals.at/en/blog/custom_ash_authentication_part_1), we set up a custom Magic Link workflow that enforces profile creation (First Name/Last Name) upon registration.
 
-If you want to see the full code, check out the main branch here: [Ash Authentication - Customize Magic Link](https://github.com/weljoda/customize_ash_authentication)
+In **Part 2**, we tackle a critical requirement for modern applications: **Compliance**. Whether it is GDPR, Terms of Service, or a Privacy Policy, you often need to prove *exactly when* a user agreed to a specific version of a document.
 
-## Getting started
+We will expand our application to:
 
-Start by setting up your project using your preferred method (see the [Ash Get Started guide](https://ash-hq.org/#get-started)) or simply run the minimalistic setup script below.
+1. Manage versioned legal documents.
+2. Capture request metadata (IP Address and User Agent) for audit trails.
+3. Intercept the Magic Link registration to enforce document acknowledgment.
 
-```shell
-mix archive.install hex igniter_new --force
-mix archive.install hex phx_new 1.8.1 --force
+## Designing the Legal Domain
 
-mix igniter.new customize_ash_authentication --with phx.new \
-  --install ash,ash_phoenix --install ash_postgres,ash_authentication \
-  --install ash_authentication_phoenix --auth-strategy magic_link --setup \
-  --yes
+We need a system that tracks different types of documents (e.g., Privacy Policy, Terms) and versions them. We also need to track who agreed to which version.
+
+```mermaid
+erDiagram
+    USER ||--o| PROFILE : "has one"
+    USER ||--o{ USER_ACKNOWLEDGEMENT : "has many"
+    DOCUMENT_VERSION ||--o{ USER_ACKNOWLEDGEMENT : "has many"
+
+    USER {
+        uuid id
+        string email
+    }
+
+    PROFILE {
+        uuid id
+        string first_name
+        string last_name
+    }
+
+    DOCUMENT_VERSION {
+        uuid id
+        string type
+        string content
+        datetime effective_from
+    }
+
+    USER_ACKNOWLEDGEMENT {
+        uuid id
+        string ip_address
+        string user_agent
+        datetime inserted_at
+    }
 ```
 
-Verify your setup:
+### The Document Version Resource
 
-* Run `mix setup` to install dependencies and set up the database.
-* Start the Phoenix endpoint with `mix phx.server` (or inside IEx with `iex -S mix phx.server`).
+First, we create a resource to hold the text content of our legal documents. We use an `effective_from` date to handle versioning, allowing us to draft new policies before they go live.
 
-Now, visit [`localhost:4000`](http://localhost:4000) in your browser.
-
-## Adding a profile
-
-Run the following mix script to generate the profile resource:
-
+Run the generator:
 ```shell
-mix ash.gen.resource CustomizeAshAuthentication.Accounts.Profile \
+mix ash.gen.resource CustomizeAshAuthentication.Legal.DocumentVersion \
   --uuid-primary-key id \
-  --attribute first_name:string \
-  --attribute last_name:string \
-  --relationship belongs_to:user:CustomizeAshAuthentication.Accounts.User:required \
+  --attribute content:string:required:public \
+  --attribute effective_from:utc_datetime \
+  --attribute type:atom \
   --timestamps \
   --extend postgres
 ```
 
-Let's add a handy calculation for the full name and ensure that a user can only have a single profile.
+Now, let's refine the resource. We need specific read actions to find the *currently active* version of a specific document type (e.g., the latest Privacy Policy).
 
+We restrict types to ensure consistency.
 ```elixir
-# lib/customize_ash_authentication/accounts/profile.ex
+# lib/customize_ash_authentication/legal/document_version.ex
 
-calculations do
-  calculate :full_name,
-            :string,
-            expr(
-              cond do
-                is_nil(first_name) and is_nil(last_name) -> nil
-                is_nil(first_name) -> last_name
-                is_nil(last_name) -> first_name
-                true -> string_trim("#{first_name} #{last_name}")
-              end
-            )
+attributes do
+  # ... generated attributes
+  attribute :type, :atom do
+    constraints one_of: [:privacy_policy, :terms_of_service]
+    allow_nil? false
+  end
 end
 
-identities do
-  identity :unique_user, [:user_id]
-end
-```
+actions do
+  defaults [:read]
+  
+  create :create do
+    primary? true
+    accept [:content, :type, :effective_from]
+  end
 
-We will also index the user reference and define an `on_delete` policy.
+  read :get_latest_by_type do
+    get? true
 
-```elixir
-# lib/customize_ash_authentication/accounts/profile.ex
+    argument :type, :atom do
+      allow_nil? false
+    end
 
-postgres do
-  table "profiles"
-  repo CustomizeAshAuthentication.Repo
+    filter expr(type == ^arg(:type) and effective_from < now())
+    prepare build(sort: [effective_from: :desc], limit: 1)
+  end
 
-  references do
-    reference :user, on_delete: :delete, index?: true
+  read :list_latest do
+    filter expr(effective_from < now())
+    prepare build(distinct: [:type], distinct_sort: [effective_from: :desc])
   end
 end
 ```
 
-We can make the relationship bidirectional by adding the relationship to the user resource.
+Generate and run the migration:
+```shell
+mix ash.codegen add_document_version
+mix ash.migrate
+```
 
+### The User Acknowledgement Resource
+
+This resource acts as the link between a `User` and a `DocumentVersion`. It serves as the immutable audit log.
+
+Run the generator:
+```shell
+mix ash.gen.resource CustomizeAshAuthentication.Legal.UserAcknowledgement \
+  --uuid-primary-key id \
+  --attribute ip:string:required \
+  --attribute user_agent:string:required \
+  --relationship belongs_to:user:CustomizeAshAuthentication.Accounts.User:required \
+  --relationship belongs_to:document_version:CustomizeAshAuthentication.Legal.DocumentVersion:required \
+  --extend postgres
+```
+
+We need to make a few adjustments to this resource. We will add a `create_timestamp` to record *when* they agreed, and add a unique identity so a user doesn't sign the exact same version twice. If a user is deleted, their acknowledgements go with them. We do not delete document versions, therefore we do not cascade deletions on acknowledgements.
+```elixir
+# lib/customize_ash_authentication/legal/user_acknowledgement.ex
+
+postgres do
+  table "user_acknowledgements"
+  repo CustomizeAshAuthentication.Repo
+
+  references do
+    # If a user is deleted, their acknowledgements go with them.
+    # We DO NOT cascade delete on document_version; legal history must be preserved.
+    reference :user, on_delete: :delete, index?: true
+    reference :document_version, index?: true
+  end
+end
+
+attributes do
+  # ... existing attributes
+  create_timestamp :inserted_at
+end
+
+identities do
+  identity :unique_user_document_version, [:user_id, :document_version_id]
+end
+```
+
+Generate and run the migration:
+```shell
+mix ash.codegen add_user_acknowledgement
+mix ash.migrate
+```
+
+### Connecting the User
+
+Now, update the User resource to make these relationships accessible. We also add an `aggregate`. This is a performance optimization that allows us to get a list of IDs of documents the user has signed without loading all the associated data rows.
 ```elixir
 # lib/customize_ash_authentication/accounts/user.ex
 
 relationships do
-  has_one :profile, CustomizeAshAuthentication.Accounts.Profile
+  # ... existing code
+
+  has_many :acknowledgements, CustomizeAshAuthentication.Legal.UserAcknowledgement
+
+  many_to_many :document_version_acknowledgements,
+               CustomizeAshAuthentication.Legal.DocumentVersion do
+    join_relationship :acknowledgements
+  end
+end
+
+aggregates do
+  list :acknowledged_document_version_ids, :document_version_acknowledgements, :id
 end
 ```
 
-Now we can create the migration and apply it to our database.
 
-```shell
-mix ash.codegen add_profile
-mix ash.migrate
-```
+## Capturing Metadata (IP & User Agent)
 
-### Profile actions
+For a legal acknowledgement to hold weight, we should capture the context of the request. In Phoenix/Ash, we can capture the IP address and User Agent in a `Plug` and pass it to the Ash Context. To achieve that we use the `:shared` key which will be propagated through managed relationships as documented [`here`](https://hexdocs.pm/ash/actions.html#shared).
 
-First, we need to implement a create and update action for our profile. We also add a validation block to avoid code duplication between the actions.
+We will also use `AshAuthentication.AddOn.AuditLog.IpPrivacy` to anonymize the IP address (truncating it), ensuring we don't violate privacy laws while trying to comply with others.
+
+Note: Ensure you remove the original `auth_routes` line from your main scope. We are moving it into this new scope to apply the metadata plug specifically to authentication actions.
 
 ```elixir
-# lib/customize_ash_authentication/accounts/profile.ex
+# lib/customize_ash_authentication_web/router.ex
+
+defp put_ash_request_context_metadata(conn, _opts) do
+  ip =
+    conn.remote_ip
+    |> :inet.ntoa()
+    |> to_string()
+    |> AshAuthentication.AddOn.AuditLog.IpPrivacy.apply_privacy(:truncate, %{})
+
+  user_agent =
+    conn
+    |> Plug.Conn.get_req_header("user-agent")
+    |> List.first()
+
+  Ash.PlugHelpers.set_context(conn, %{shared: %{client_ip: ip, user_agent: user_agent}})
+end
+
+scope "/", CustomizeAshAuthenticationWeb do
+  pipe_through [:browser, :put_ash_request_context_metadata]
+  
+  auth_routes AuthController, CustomizeAshAuthentication.Accounts.User, path: "/auth"
+end
+```
+
+> **Note:** This customization requires **Ash Authentication v4.13.8** or later to work correctly due to a bug in previous versions regarding the `:shared` context.
+> If necessary, update your `mix.exs`: `{:ash_authentication, "~> 4.13.8"}` or `{:ash_authentication, github: "team-alembic/ash_authentication", branch: "main", override: true}` .
+
+## The Acknowledgement Logic
+
+Now we configure the `UserAcknowledgement` resource to pull that metadata out of the context and save it automatically when a record is created.
+
+```elixir
+# lib/customize_ash_authentication/legal/user_acknowledgement.ex
 
 actions do
   defaults [:read]
-
-  create :create_on_registration do
+  
+  create :create do
     primary? true
-    upsert? true
-    accept [:first_name, :last_name]
+    accept [:document_version_id]
+  
+    argument :accepted, :boolean do
+      allow_nil? false
+    end
+  
+    change before_action(fn %{context: context} = changeset, _context ->
+             changeset
+             |> Ash.Changeset.force_change_attribute(:ip, context[:client_ip])
+             |> Ash.Changeset.force_change_attribute(:user_agent, context[:user_agent])
+           end)
+  
+    validate argument_equals(:accepted, true),
+      message: "An acknowledgment is required"
   end
-
-  update :update do
-    primary? true
-    require_atomic? false
-    accept [:first_name, :last_name]
-  end
-end
-
-validations do
-  validate string_length(:first_name, min: 2),
-    message: "Please enter a first name",
-    on: [:create, :update]
-
-  validate present(:first_name),
-    message: "Please enter a first name",
-    on: [:create, :update]
-
-  validate string_length(:last_name, min: 2),
-    message: "Please enter a last name",
-    on: [:create, :update]
-
-  validate present(:last_name),
-    message: "Please enter a last name",
-    on: [:create, :update]
 end
 ```
 
-Note that we do not add the `user_id` to the create action arguments. It will be automatically applied by the `manage_relationship` change in the user resource.
+### Exposing the Code Interface
 
-The Magic Link sign-in strategy usually creates the user automatically. We need to intercept this by extending the register action in `user.ex` to accept profile arguments.
+To make our LiveView easier to write, we expose specific actions via the Code Interface:
+```elixir
+# lib/customize_ash_authentication/legal.ex
+
+resource CustomizeAshAuthentication.Legal.DocumentVersion do
+  define :list_latest_document_versions,
+    action: :list_latest
+      
+  define :create_document_version,
+    action: :create,
+    args: [:content, :type, {:optional, :effective_from}]
+    
+  define :get_latest_document_version_by_type,
+    action: :get_latest_by_type,
+    args: [:type]
+end
+```
+
+### Updating the User Sign-In Action
+
+Finally, update the User resource to accept these acknowledgements during the Magic Link sign-in process.
 
 ```elixir
 # lib/customize_ash_authentication/accounts/user.ex
 
 create :sign_in_with_magic_link do
-  # ... existing code
+  # ... existing profile arguments
   
-  argument :profile, :map
-
-  # ... existing code
+  argument :acknowledgements, {:array, :map}
   
-  change manage_relationship(:profile,
-            on_no_match: :create,
-            on_match: :update
-          )
+  # ... existing profile changes
+  
+  change manage_relationship(:acknowledgements, type: :create)
 end
 ```
 
-### Exposing the User lookup
 
-Before we build the LiveView, we need to expose a way to fetch the user by their email address via the code interface. This will allow our LiveView to look up the user when processing the magic link.
+## The Magic Link LiveView
 
-Add the following definition to your Accounts domain module:
+This is where everything comes together. When the user clicks the Magic Link, we check which active documents they haven't signed yet and present them in the form.
 
-```elixir
-# lib/customize_ash_authentication/accounts.ex
 
-resource CustomizeAshAuthentication.Accounts.User do
-  define :get_user_by_email,
-    action: :get_by_email,
-    args: [:email]
-end
+```mermaid
+sequenceDiagram
+    actor User
+    participant Browser
+    participant Server
+    participant Database
+
+    User->>Browser: Enters Email
+    Browser->>Server: Request Magic Link
+    Server-->>User: Sends Email with Token
+
+    User->>Browser: Clicks Magic Link
+    Browser->>Server: GET /magic_link/:token
+    note right of Server: Inspection Phase
+    Server->>Database: Fetch User + Acknowledged IDs
+    Server->>Database: Fetch Latest Active Documents
+    Server->>Server: Filter unaccepted documents
+    Server-->>Browser: Render Form (Profile + Checkboxes)
+
+    User->>Browser: Fills Form, Submits
+    Browser->>Server: POST /auth/user/magic_link
+
+    note right of Server: Transaction
+    Server->>Database: Create/Update User
+    Server->>Database: Create Profile
+    Server->>Database: Create UserAcknowledgements
+    Server-->>Browser: Set Session Cookie & Redirect
+    Browser-->>User: Logged In
 ```
 
-### Custom Magic Sign-In LiveView
+### Loading User Data
 
-Since we modified the create action, we also need to customize the corresponding form by creating a custom "Sign In" LiveView.
-
-The default sign-in LiveView contains a form with the token as a hidden input and a simple submit button. This interaction is required (via the `require_interaction? true` setting) to prevent email scanners or clients from prematurely consuming the magic link token.
-
-Our customized form will handle two scenarios:
-
-1. **Existing User:** It handles the sign-in process via the magic link.
-2. **New User:** It handles the registration process by collecting profile data.
-
-I'll provide the full code first, and we will break down the specific parts afterwards.
-
+We need to load the `acknowledged_document_version_ids` aggregate when we fetch the user.
 
 ```elixir
 # lib/customize_ash_authentication_web/live/magic_sign_in.ex
 
-defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
-  use CustomizeAshAuthenticationWeb, :live_view
-  require Ash.Query
-
-  alias CustomizeAshAuthentication.Accounts
-  alias CustomizeAshAuthentication.Accounts.User
-  alias CustomizeAshAuthentication.Accounts.Profile
-  alias AshAuthentication.Jwt.Config
-
-  @impl true
-  def mount(_params, _session, socket) do
-    {:ok, assign_page_title(socket)}
-  end
-
-  @impl true
-  def handle_params(params, _uri, socket) do
-    socket = assign(socket, :token, params["token"])
-
-    with {:ok, socket} <- assign_email(socket) do
-      socket
-      |> assign_user_assigns()
-      |> assign_page_title()
-      |> assign(:trigger_submit, false)
-      |> assign_form()
-      |> then(&{:noreply, &1})
-    else
-      {:halt, socket} ->
-        {:noreply, socket}
-    end
-  end
-
-  @impl true
-  def handle_event("validate", %{"user" => _params}, socket) do
-    # form = AshPhoenix.Form.validate(socket.assigns.form, params)
-    # {:noreply, assign(socket, form: to_form(form))}
-    {:noreply, socket}
-  end
-
-  def handle_event("submit", %{"user" => params}, socket) do
-    form = AshPhoenix.Form.validate(socket.assigns.form, params)
-
-    if form.source.valid? do
-      {:noreply, assign(socket, trigger_submit: true, form: to_form(form))}
-    else
-      {:noreply, assign(socket, form: to_form(form))}
-    end
-  end
-
-  defp assign_form(
-         %{
-           assigns: %{
-             token: token,
-             profile: profile
-           }
-         } = socket
+defp assign_user_assigns(%{assigns: %{email: email}} = socket) do
+  case Accounts.get_user_by_email!(email,
+         load: [
+           :acknowledged_document_version_ids,
+           profile: [:first_name, :last_name, :full_name]
+         ],
+         not_found_error?: false,
+         authorize?: false
        ) do
-    form =
-      AshPhoenix.Form.for_create(
-        User,
-        :sign_in_with_magic_link,
-        params: %{profile: profile, token: token},
-        as: "user",
-        load: [:profile],
-        forms: [
-          profile: [
-            type: :single,
-            resource: Profile,
-            create_action: :create_on_registration
-          ]
+    nil ->
+      socket
+      |> assign(:profile, %{})
+      |> assign(:acknowledged_document_version_ids, []) # New user has signed nothing
+      |> assign(:action_label, label(true))
+      |> assign(:name, nil)
+
+    user ->
+      socket
+      |> assign(:profile, profile_to_map(user.profile))
+      |> assign(:acknowledged_document_version_ids, user.acknowledged_document_version_ids)
+      |> assign(:action_label, label(false))
+      |> assign(:name, if(user.profile, do: user.profile.full_name, else: nil))
+  end
+end
+```
+
+### Preparing the Form
+
+We calculate which documents are missing and pre-fill the form params. AshPhoenix will see these params and generate the necessary nested form structures.
+```elixir
+# lib/customize_ash_authentication_web/live/magic_sign_in.ex
+
+defp assign_form(
+       %{
+         assigns: %{
+           token: token,
+           acknowledged_document_version_ids: acknowledged_document_version_ids,
+           profile: profile
+         }
+       } = socket
+     ) do
+  # 1. Fetch all currently active document versions
+  # 2. Filter out the ones the user ID list already contains
+  document_versions =
+    CustomizeAshAuthentication.Legal.list_latest_document_versions!()
+    |> Enum.filter(fn document_version ->
+      document_version.id not in acknowledged_document_version_ids
+    end)
+
+  # Prepare the params for the form. 
+  # We set 'accepted' to false initially so the user must click it.
+  acknowledgements =
+    document_versions
+    |> Enum.map(fn document_version ->
+      %{
+        accepted: false,
+        document_version_id: document_version.id
+      }
+    end)
+
+  form =
+    AshPhoenix.Form.for_create(
+      User,
+      :sign_in_with_magic_link,
+      params: %{
+        profile: profile, 
+        acknowledgements: acknowledgements, 
+        token: token
+      },
+      as: "user",
+      load: [:profile, :acknowledgements],
+      forms: [
+        profile: [
+          type: :single,
+          resource: Profile,
+          create_action: :create_on_registration
+        ],
+        acknowledgements: [
+          type: :list,
+          resource: CustomizeAshAuthentication.Legal.UserAcknowledgement,
+          create_action: :create
         ]
-      )
+      ]
+    )
 
-    socket
-    |> assign(:form, to_form(form))
-  end
+  socket
+  |> assign(:form, to_form(form))
+  |> assign(:document_versions, document_versions)
+end
+```
 
-  defp assign_email(%{assigns: %{token: token}} = socket) do
-    with signer <- Config.token_signer(User),
-         {:ok, %{"identity" => identity} = claims} <- Joken.verify(token, signer),
-         defaults <- Config.default_claims(User),
-         {:ok, _claims} <- Joken.validate(defaults, claims, User) do
-      {:ok, assign(socket, :email, identity)}
-    else
+### Rendering the Form
+
+We use `inputs_for` to loop over the required acknowledgements. We also use a helper `acknowledgement_label` to generate a link to the document. For simplicity we'll just transform the type atom to the title. But normally you should use something like `Gettext` to handle the labels properly.
+
+**Note:** Generating HTML in a helper and using `raw()` carries security risks (XSS). Ensure that the data passed into the string (like `@type`) is controlled by you, or sanitize it properly.
+```elixir
+# lib/customize_ash_authentication_web/live/magic_sign_in.ex
+
+def render(assigns) do
+  ~H"""
+  <!-- ... form with other inputs -->
+  <.inputs_for :let={acknowledgement} field={@form[:acknowledgements]}>
+    <input
+      type="hidden"
+      name={acknowledgement[:document_version_id].name}
+      value={acknowledgement[:document_version_id].value}
+    />
+    <.input
+      field={acknowledgement[:accepted]}
+      type="checkbox"
+      label={
+        @document_versions |> Enum.at(acknowledgement.index) |> acknowledgement_label()
+      }
+    />
+  </.inputs_for>
+  <!-- ... submit button -->
+  """
+end
+
+defp acknowledgement_label(%{effective_from: effective_from, type: type}),
+  do: """
+  I accept the
+  <a href=#{~p"/documents/#{type}"} class="underline" target="_blank">
+  #{type |> Atom.to_string() |> CustomizeAshAuthenticationWeb.DocumentController.type_to_title()}.
+  </a>
+  Effective since: #{effective_from |> DateTime.to_date() |> Date.to_string()}
+  """
+```
+
+*Note: You may need to update your `core_components.ex` `input` function to support `Phoenix.HTML.raw(@label)` inside the checkbox label span, or the HTML tags will be escaped and visible to the user.*
+
+See the following snippet.
+
+```elixir
+# lib/customize_ash_authentication_web/components/core_components.ex
+ 
+def input(%{type: "checkbox"} = assigns) do
+  assigns =
+    assign_new(assigns, :checked, fn ->
+      Phoenix.HTML.Form.normalize_value("checkbox", assigns[:value])
+    end)
+
+  ~H"""
+  <div class="fieldset mb-2">
+    <label>
+      <input type="hidden" name={@name} value="false" disabled={@rest[:disabled]} />
+      <span class="label">
+        <input
+          type="checkbox"
+          id={@id}
+          name={@name}
+          value="true"
+          checked={@checked}
+          class={@class || "checkbox checkbox-sm"}
+          {@rest}
+        />
+        {Phoenix.HTML.raw(@label)}
+      </span>
+    </label>
+    <.error :for={msg <- @errors}>{msg}</.error>
+  </div>
+  """
+end
+```
+
+
+## Displaying the Documents
+
+We need a controller to actually render the document content when the user clicks the link in the checkbox label.
+
+```elixir
+# lib/customize_ash_authentication_web/controllers/document_controller.ex
+
+defmodule CustomizeAshAuthenticationWeb.DocumentController do
+  use CustomizeAshAuthenticationWeb, :controller
+  alias CustomizeAshAuthentication.Legal
+
+  plug :put_layout, false
+
+  def show(conn, %{"type" => type}) do
+    case Legal.get_latest_document_version_by_type(type) do
+      {:ok, document} ->
+        render(conn, :show, content: document.content, title: type_to_title(type))
+
       _ ->
-        {:halt,
-         socket
-         |> put_flash(:error, "Invalid link, please try again.")
-         |> push_navigate(to: ~p"/sign-in")}
+        conn
+        |> put_flash(:error, "Document not available.")
+        |> redirect(to: ~p"/")
     end
   end
 
-  defp assign_user_assigns(%{assigns: %{email: email}} = socket) do
-    case Accounts.get_user_by_email!(email,
-           load: [
-             profile: [:first_name, :last_name, :full_name]
-           ],
-           not_found_error?: false,
-           authorize?: false
-         ) do
-      nil ->
-        socket
-        |> assign(:profile, %{})
-        |> assign(:action_label, label(true))
-        |> assign(:name, nil)
-
-      user ->
-        socket
-        |> assign(:profile, profile_to_map(user.profile))
-        |> assign(:action_label, label(false))
-        |> assign(:name, if(user.profile, do: user.profile.full_name, else: nil))
-    end
+  # A simple helper to pretty-print the original atom (e.g. :privacy_policy -> "Privacy Policy")
+  def type_to_title(type) when is_binary(type) do
+    type
+    |> String.split("_")
+    |> Enum.map(&String.capitalize/1)
+    |> Enum.join(" ")
   end
+end
+```
 
-  defp profile_to_map(nil), do: %{}
+```elixir
+# lib/customize_ash_authentication_web/controllers/document_html.ex
 
-  defp profile_to_map(profile),
-    do: Map.take(profile, [:id, :first_name, :last_name])
+defmodule CustomizeAshAuthenticationWeb.DocumentHTML do
+  use CustomizeAshAuthenticationWeb, :html
 
-  defp assign_page_title(%{assigns: %{action_label: action_label}} = socket),
-    do: assign(socket, :page_title, action_label)
-
-  defp assign_page_title(socket),
-    do: assign(socket, :page_title, label(true))
-
-  defp label(is_registration), do: if(is_registration, do: "Register", else: "Login")
-
-  @impl true
-  def render(assigns) do
+  def show(assigns) do
     ~H"""
-    <div class="grid h-screen place-items-center bg-base-100">
-      <div class="flex-1 flex flex-col justify-center py-12 px-4 lg:flex-none">
-        <div class="w-full flex justify-center py-2">
-          <a class="text-3xl sm:text-4xl lg:text-5xl" href="/">
-            Custom Magic Link - Ash Authentication
-          </a>
-        </div>
-        <div class="mx-auto w-full max-w-sm lg:w-96">
-          <div class="mt-4 mb-4">
-            <%= if @name do %>
-              Hello {@name}, welcome back!
-            <% end %>
-            <.form
-              for={@form}
-              action={~p"/auth/user/magic_link"}
-              method="post"
-              phx-change="validate"
-              phx-submit="submit"
-              phx-trigger-action={@trigger_submit}
-              class="flex flex-col gap-2"
-            >
-              <input type="hidden" name="user[token]" value={@token} />
-
-              <%= if %{} == @profile do %>
-                <.inputs_for :let={profile} field={@form[:profile]}>
-                  <.input
-                    phx-debounce="200"
-                    field={profile[:first_name]}
-                    type="text"
-                    label="First name"
-                  />
-                  <.input
-                    phx-debounce="200"
-                    field={profile[:last_name]}
-                    type="text"
-                    label="Last name"
-                  />
-                </.inputs_for>
-              <% end %>
-
-              <button
-                class="btn btn-primary btn-block mt-4 mb-4"
-                phx-disable-with={@action_label <> " ..."}
-                type="submit"
-              >
-                {@action_label}
-              </button>
-            </.form>
-          </div>
+    <div class="grid min-h-screen place-items-center bg-base-100 py-12 px-4">
+      <div class="mx-auto w-full max-w-2xl">
+        <h1 class="text-2xl sm:text-3xl lg:text-4xl py-6 flex justify-center">{@title}</h1>
+        <div class="p-6">
+          {raw(@content)}
         </div>
       </div>
     </div>
@@ -376,152 +547,49 @@ defmodule CustomizeAshAuthenticationWeb.MagicSignIn do
 end
 ```
 
-We start with `handle_params` to capture the received token. Next, we verify the token and extract the encoded email address using the following code:
-
-```elixir
-defp assign_email(%{assigns: %{token: token}} = socket) do
-  with signer <- Config.token_signer(User),
-       {:ok, %{"identity" => identity} = claims} <- Joken.verify(token, signer),
-       defaults <- Config.default_claims(User),
-       {:ok, _claims} <- Joken.validate(defaults, claims, User) do
-    {:ok, assign(socket, :email, identity)}
-  else
-    _ ->
-      {:halt,
-       socket
-       |> put_flash(:error, "Invalid link, please try again.")
-       |> push_navigate(to: ~p"/sign-in")}
-  end
-end
-```
-
-Then, we load the user data and assign the profile if it exists. We use `authorize?: false` to bypass policy checks since we don't have an authenticated actor yet, relying instead on the verified token.
-
-We also need to convert the profile struct to a map, containing only the params needed in the form.
-
-```elixir
-case Accounts.get_user_by_email!(email,
-        load: [
-          profile: [:first_name, :last_name, :full_name]
-        ],
-        not_found_error?: false,
-        authorize?: false
-      ) do
-  nil ->
-    socket
-    |> assign(:profile, %{})
-    |> assign(:action_label, label(true))
-    |> assign(:name, nil)
-
-  user ->
-    socket
-    |> assign(:profile, profile_to_map(user.profile))
-    |> assign(:action_label, label(false))
-    |> assign(:name, if(user.profile, do: user.profile.full_name, else: nil))
-end
-```
-
-You might notice potential for optimization by loading the profile directly instead of the user. While true, we will need access to other user attributes in Part 2 of this series.
-
-Now we generate the form using `AshPhoenix.Form.for_create`. We explicitly add the related profile and specify which action to use for its creation.
-
-```elixir
-AshPhoenix.Form.for_create(
-  User,
-  :sign_in_with_magic_link,
-  params: %{profile: profile, token: token},
-  as: "user",
-  load: [:profile],
-  forms: [
-    profile: [
-      type: :single,
-      resource: Profile,
-      create_action: :create_on_registration
-    ]
-  ]
-)
-```
-
-Finally, the form itself. We wrap the profile inputs in the `inputs_for` component and render them only if no profile exists yet.
-
-```heex
-<.form
-  for={@form}
-  action={~p"/auth/user/magic_link"}
-  method="post"
-  phx-change="validate"
-  phx-submit="submit"
-  phx-trigger-action={@trigger_submit}
-  class="flex flex-col gap-2"
->
-  <input type="hidden" name="user[token]" value={@token} />
-
-  <%= if %{} == @profile do %>
-    <.inputs_for :let={profile} field={@form[:profile]}>
-      <.input
-        phx-debounce="200"
-        field={profile[:first_name]}
-        type="text"
-        label="First name"
-      />
-      <.input
-        phx-debounce="200"
-        field={profile[:last_name]}
-        type="text"
-        label="Last name"
-      />
-    </.inputs_for>
-  <% end %>
-
-  <button
-    class="btn btn-primary btn-block mt-4 mb-4"
-    phx-disable-with={@action_label <> " ..."}
-    type="submit"
-  >
-    {@action_label}
-  </button>
-</.form>
-```
-
-Note that we use standard HTML attributes (`action=...`, `method="post"`) and `phx-trigger-action={@trigger_submit}`. Crucially, we do **not** call `AshPhoenix.Form.submit/2`. Instead, we validate the form manually in the `handle_event`.
-
-This approach ensures the form is submitted via a regular HTTP POST request rather than over the LiveView WebSocket. This is necessary to set the authentication session cookie in the browser connection.
-
-```elixir
-def handle_event("submit", %{"user" => params}, socket) do
-  form = AshPhoenix.Form.validate(socket.assigns.form, params)
-
-  if form.source.valid? do
-    {:noreply, assign(socket, trigger_submit: true, form: to_form(form))}
-  else
-    {:noreply, assign(socket, form: to_form(form))}
-  end
-end
-```
-
-Finally, we need to adapt the router to use our new `MagicSignIn` instead of the default one. Uncomment the following lines and add one to replace the route.
-
+Add the route to `router.ex`:
 ```elixir
 # lib/customize_ash_authentication_web/router.ex
 
-# Remove this if you do not use the magic link strategy.
-# magic_sign_in_route(CustomizeAshAuthentication.Accounts.User, :magic_link,
-#   auth_routes_prefix: "/auth",
-#   overrides: [
-#     CustomizeAshAuthenticationWeb.AuthOverrides,
-#     Elixir.AshAuthentication.Phoenix.Overrides.DaisyUI
-#   ]
-# )
-
-live "/magic_link/:token", MagicSignIn, :show
+scope "/", CustomizeAshAuthenticationWeb do
+  pipe_through :browser
+  
+  # ... existing routes 
+  
+  get "/documents/:type", DocumentController, :show
+end
 ```
 
-## Manual testing
 
-You can manually test the magic link workflow by navigating to [`http://localhost:4000/sign-in`](http://localhost:4000/sign-in) and entering your email address. Then, visit [`http://localhost:4000/dev/mailbox`](http://localhost:4000/dev/mailbox) and follow the link in the email. Then fill in the registration form.
+## Testing
 
-You should now see a registration form similar to this:
+Let's verify the workflow. Start your server with `iex -S mix phx.server` and create a dummy document version:
+```elixir
+CustomizeAshAuthentication.Legal.create_document_version!(
+  "<p>Your deepest secrets will be revealed to the universe.</p>", 
+  :privacy_policy, 
+  DateTime.utc_now()
+)
+```
+And another one:
 
-And that's it! While we don't have any protected routes yet, you can easily add them by following the [Ash Authentication Phoenix documentation](https://hexdocs.pm/ash_authentication_phoenix/liveview.html).
+```elixir
+CustomizeAshAuthentication.Legal.create_document_version!(
+  "<p>After death, ownership of your soul will be claimed by the Devil.</p>", 
+  :terms_of_service, 
+  DateTime.utc_now()
+)
+```
 
-The beauty of this Magic Link workflow is that the user is fully persisted only *after* clicking the link and submitting the form. This "just-in-time" creation is perfect for adding GDPR-compliant acknowledgements, which we will tackle in the next part.
+1. Navigate to [`http://localhost:4000/sign-in`](http://localhost:4000/sign-in).
+2. Enter your email.
+3. Navigate to the development mailbox [`http://localhost:4000/dev/mailbox`](http://localhost:4000/dev/mailbox) for the link.
+4. Click the link. You should see the **First Name** and **Last Name** fields (from Part 1) AND a checkbox for the **Privacy Policy** and the **Terms of Service**.
+5. If you try to submit without checking the box, validation will fail.
+6. Once you submit, check the database (or Ash Resource). You will see a `UserAcknowledgement` record containing your (anonymized) IP and User Agent.
+
+### Conclusion
+
+You now have a fully compliant "Just-In-Time" registration flow. The user is only persisted when they have provided all necessary profile data and legally agreed to your terms.
+
+It also forces existing users to re-accept new versions of terms when they next log in. But if you have a long living token, they might use your service without re-accepting the new terms for a while.
